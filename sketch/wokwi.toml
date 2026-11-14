@@ -1,0 +1,6 @@
+# Usado pela extensão Wokwi do VS Code e pelo wokwi-cli.
+# Gere o firmware com: arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir build .
+[wokwi]
+version = 1
+firmware = "build/sketch.ino.bin"
+elf = "build/sketch.ino.elf"
