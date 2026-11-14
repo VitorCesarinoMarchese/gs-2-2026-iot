@@ -74,16 +74,20 @@ struct OutEvent {
   char     alertId[40];
   time_t   createdTs;     // epoch UTC (0 se o relógio ainda não sincronizou)
   uint32_t createdMs;
+  uint32_t order;         // ordem de criação (contador; desempata eventos do mesmo milissegundo)
   uint32_t lastSentMs;
   uint16_t attempts;
 };
 
 static const uint8_t OUTBOX_SIZE = 6;
 OutEvent outbox[OUTBOX_SIZE];
+uint32_t outboxOrder = 0;
 
 uint32_t eventSeq = 0;
 char     activeAlertId[40] = "";
 bool     activeAlertAcked  = false;
+time_t   activeAlertTs     = 0;      // hora do clique do alerta ativo (sobrevive a reinício)
+uint32_t bootTag           = 0;      // muda a cada boot: eventId não repete mesmo se a flash for apagada
 
 uint8_t  batteryPct = 100;
 bool     lowBattery = false;
@@ -96,6 +100,13 @@ uint32_t btnPressedAtMs  = 0;
 bool     longPressFired  = false;
 uint8_t  clickCount      = 0;
 uint32_t lastClickMs     = 0;
+// ISR registra o gesto mesmo com o loop bloqueado (ex.: conectando ao broker)
+volatile bool     pressLatched   = false;  // houve descida
+volatile bool     pressReleased  = false;  // houve subida depois dela
+volatile uint32_t pressLatchMs   = 0;      // primeira descida
+volatile uint32_t pressReleaseMs = 0;      // última subida
+volatile uint32_t lastRiseMs     = 0;      // primeira subida depois de um aperto aceito pelo debounce
+volatile bool     riseArmed      = false;  // aperto aceito, ainda sem soltura registrada
 
 // Conectividade
 uint32_t lastWifiAttemptMs = 0;
@@ -105,11 +116,17 @@ bool     ntpStarted        = false;
 uint32_t lastHeartbeatMs   = 0;
 bool     statusRequested   = false;
 
-// Feedback visual/sonoro
+// Feedback visual/sonoro (início + duração: seguro na virada do millis())
 Color    flashColor   = OFF;
-uint32_t flashUntilMs = 0;
+bool     flashActive  = false;
+uint32_t flashStartMs = 0;
+uint32_t flashDurMs   = 0;
 uint16_t flashBlinkMs = 0;   // 0 = aceso fixo
-uint32_t findUntilMs  = 0;
+bool     findActive   = false;
+uint32_t findStartMs  = 0;
+bool     beepActive   = false;  // bipe curto de "teste confirmado"
+uint32_t beepStartMs  = 0;
+bool     buzzerOn     = false;
 
 // ───────────────────────── Utilidades ─────────────────────────
 time_t nowEpoch() {
@@ -125,8 +142,33 @@ void setColor(Color c) {
 
 void flash(Color c, uint32_t durationMs, uint16_t blinkMs = 0) {
   flashColor   = c;
-  flashUntilMs = millis() + durationMs;
+  flashActive  = true;
+  flashStartMs = millis();
+  flashDurMs   = durationMs;
   flashBlinkMs = blinkMs;
+}
+
+void stopSound() {
+  findActive = false;
+  beepActive = false;
+  if (buzzerOn) { noTone(PIN_BUZZER); buzzerOn = false; }
+}
+
+// Guarda o primeiro gesto completo (aperto + soltura). Repique: uma descida logo depois de uma
+// subida desfaz a "soltura". Toques seguintes, já com o gesto completo, são ignorados.
+void IRAM_ATTR onButtonChange() {
+  uint32_t t = millis();
+  if (digitalRead(PIN_BUTTON) == LOW) {
+    if (!pressLatched) {
+      if (t - lastRiseMs < DEBOUNCE_MS) return;  // repique da soltura que acabou de ser registrada
+      pressLatched = true; pressReleased = false; pressLatchMs = t;
+    } else if (pressReleased && t - pressReleaseMs < DEBOUNCE_MS) {
+      pressReleased = false;                 // era repique, o botão continua apertado
+    }
+  } else {
+    if (riseArmed) { riseArmed = false; lastRiseMs = t; }
+    if (pressLatched && !pressReleased) { pressReleased = true; pressReleaseMs = t; }
+  }
 }
 
 // Pulso curto a cada "period" ms: discreto e economiza bateria.
@@ -138,6 +180,7 @@ bool alertActive() { return activeAlertId[0] != '\0'; }
 void persistAlert() {
   prefs.putString("alertId", activeAlertId);
   prefs.putBool("alertAcked", activeAlertAcked);
+  prefs.putLong64("alertTs", (int64_t)activeAlertTs);
 }
 
 uint8_t readBatteryPct() {
@@ -147,17 +190,28 @@ uint8_t readBatteryPct() {
 }
 
 // ───────────────────────── Fila de saída ─────────────────────────
+// Prioridade na fila cheia: teste e bateria saem primeiro, cancelamento depois, alerta nunca.
+int eventRank(const char *type) {
+  if (strcmp(type, "alert") == 0) return 2;
+  if (strcmp(type, "cancel") == 0) return 1;
+  return 0;
+}
+
 OutEvent *enqueue(const char *type, bool needsAck, const char *alertId = nullptr,
                   const char *reuseEventId = nullptr) {
-  // Procura vaga; se a fila lotar, descarta o evento mais antigo que não seja alerta.
   OutEvent *slot = nullptr;
   for (auto &e : outbox) if (!e.used) { slot = &e; break; }
   if (!slot) {
     for (auto &e : outbox) {
-      if (strcmp(e.type, "alert") != 0 && (!slot || e.createdMs < slot->createdMs)) slot = &e;
+      int re = eventRank(e.type), rs = slot ? eventRank(slot->type) : 99;
+      if (re < rs || (re == rs && e.order < slot->order)) slot = &e;
+    }
+    // Fila cheia de eventos mais importantes que este: o novo é que fica de fora.
+    if (eventRank(slot->type) > eventRank(type)) {
+      Serial.printf("[FILA] Cheia; evento %s descartado.\n", type);
+      return nullptr;
     }
   }
-  if (!slot) slot = &outbox[0];
 
   memset(slot, 0, sizeof(*slot));
   slot->used     = true;
@@ -165,14 +219,18 @@ OutEvent *enqueue(const char *type, bool needsAck, const char *alertId = nullptr
   if (reuseEventId) {
     strlcpy(slot->eventId, reuseEventId, sizeof(slot->eventId));
   } else {
+    // Etiqueta do boot: a hora do relógio (se já sincronizou) ou um número aleatório.
+    if (!bootTag) bootTag = nowEpoch() ? (uint32_t)nowEpoch() : ((esp_random() ^ micros()) | 1);
     eventSeq++;
     prefs.putUInt("seq", eventSeq);
-    snprintf(slot->eventId, sizeof(slot->eventId), "%s-%lu", DEVICE_ID, (unsigned long)eventSeq);
+    snprintf(slot->eventId, sizeof(slot->eventId), "%s-%08lx-%lu", DEVICE_ID, (unsigned long)bootTag,
+             (unsigned long)eventSeq);
   }
   strlcpy(slot->type, type, sizeof(slot->type));
   strlcpy(slot->alertId, alertId ? alertId : "", sizeof(slot->alertId));
   slot->createdTs = nowEpoch();
   slot->createdMs = millis();
+  slot->order     = ++outboxOrder;
   return slot;
 }
 
@@ -199,14 +257,39 @@ bool publishEvent(OutEvent &e) {
   return ok;
 }
 
+// Regra de ordem: um evento nunca sai antes dos eventos mais antigos ainda sem confirmação.
+// Sempre que algo sai, os pendentes mais antigos saem junto, antes, em ordem de criação.
+// O app processa na ordem de chegada, então um "cancel" antigo nunca chega depois de um
+// alerta mais novo (e não fecha a emergência nova).
 void serviceOutbox() {
   if (!mqtt.connected()) return;
   uint32_t now = millis();
-  for (auto &e : outbox) {
+  bool due[OUTBOX_SIZE] = {};
+  int newestDue = -1;
+  for (int i = 0; i < OUTBOX_SIZE; i++) {
+    OutEvent &e = outbox[i];
     if (!e.used) continue;
-    bool due = e.attempts == 0 || (e.needsAck && now - e.lastSentMs >= RETRY_INTERVAL_MS);
-    if (!due) continue;
-    if (publishEvent(e) && !e.needsAck) e.used = false;  // dispara-e-esquece
+    due[i] = e.attempts == 0 || (e.needsAck && now - e.lastSentMs >= RETRY_INTERVAL_MS);
+    if (due[i] && (newestDue < 0 || e.order > outbox[newestDue].order)) newestDue = i;
+  }
+  if (newestDue < 0) return;
+  for (int i = 0; i < OUTBOX_SIZE; i++) {
+    OutEvent &e = outbox[i];
+    if (e.used && e.needsAck && e.order < outbox[newestDue].order) due[i] = true;
+  }
+  bool done[OUTBOX_SIZE] = {};
+  for (;;) {
+    int pick = -1;
+    for (int i = 0; i < OUTBOX_SIZE; i++) {
+      OutEvent &e = outbox[i];
+      if (done[i] || !e.used || !due[i]) continue;
+      if (pick < 0 || e.order < outbox[pick].order) pick = i;
+    }
+    if (pick < 0) break;
+    done[pick] = true;
+    // Falhou: para aqui, para nenhum evento mais novo passar na frente; tenta de novo depois.
+    if (!publishEvent(outbox[pick])) break;
+    if (!outbox[pick].needsAck) outbox[pick].used = false;  // dispara-e-esquece
   }
 }
 
@@ -218,17 +301,27 @@ void dropOutboxForAlert(const char *alertId) {
 
 // ───────────────────────── Ações do usuário ─────────────────────────
 void triggerAlert() {
-  if (alertActive()) {
+  stopSound();  // alerta é silencioso: corta qualquer som em andamento
+
+  if (alertActive() && !activeAlertAcked) {
     // Clique extra com alerta ainda sem confirmação: reenvia já, sem esperar o próximo ciclo.
-    for (auto &e : outbox) if (e.used && strcmp(e.eventId, activeAlertId) == 0) e.attempts = 0;
-    Serial.println("[ALERTA] Já existe alerta ativo; reforçando envio.");
+    for (auto &e : outbox) {
+      if (e.used && strcmp(e.eventId, activeAlertId) == 0) e.lastSentMs = millis() - RETRY_INTERVAL_MS;
+    }
+    Serial.println("[ALERTA] Já existe alerta aguardando confirmação; reforçando envio.");
+    serviceOutbox();
     return;
   }
+  // Alerta anterior já confirmado e ainda aberto: um novo aperto é uma nova emergência.
+  if (alertActive()) Serial.printf("[ALERTA] Alerta %s já confirmado; abrindo um novo.\n", activeAlertId);
+
   OutEvent *e = enqueue("alert", true);
   strlcpy(e->alertId, e->eventId, sizeof(e->alertId));
   strlcpy(activeAlertId, e->eventId, sizeof(activeAlertId));
   activeAlertAcked = false;
+  activeAlertTs    = e->createdTs;
   persistAlert();
+  statusRequested = true;
   Serial.printf("[ALERTA] Botão de pânico acionado! id=%s\n", activeAlertId);
   serviceOutbox();  // tenta mandar na hora
 }
@@ -240,7 +333,9 @@ void cancelAlert() {
   enqueue("cancel", true, id);
   activeAlertId[0] = '\0';
   activeAlertAcked = false;
+  activeAlertTs    = 0;
   persistAlert();
+  statusRequested = true;
   flash(GREEN, 1500, 150);
   Serial.printf("[ALERTA] Cancelado pelo usuário (estou bem). id=%s\n", id);
   serviceOutbox();
@@ -254,6 +349,25 @@ void sendTest() {
 }
 
 // ───────────────────────── Botão ─────────────────────────
+void registerClick(uint32_t now) {
+  if (now - lastClickMs > MULTI_CLICK_WINDOW_MS) clickCount = 0;
+  clickCount++;
+  lastClickMs = now;
+  if (clickCount >= CLICKS_TO_TRIGGER) { clickCount = 0; triggerAlert(); }
+}
+
+// Gesto inteiro (aperto + soltura) que o polling não viu porque o loop estava parado.
+void handleRecoveredGesture(uint32_t held, uint32_t now) {
+  if (held >= LONG_PRESS_MS) {
+    Serial.println("[BOTAO] Pressão longa registrada enquanto o chaveiro estava ocupado.");
+    clickCount = 0;
+    if (alertActive()) cancelAlert(); else sendTest();
+  } else if (held >= DEBOUNCE_MS) {  // mais curto que isso é ruído, como no debounce normal
+    Serial.println("[BOTAO] Clique registrado enquanto o chaveiro estava ocupado.");
+    registerClick(now);
+  }
+}
+
 void handleButton() {
   uint32_t now = millis();
   bool reading = digitalRead(PIN_BUTTON);
@@ -262,19 +376,52 @@ void handleButton() {
 
   if (now - btnLastChangeMs >= DEBOUNCE_MS && reading != btnStable) {
     btnStable = reading;
+    bool     hadLatch   = pressLatched;
+    bool     hadRelease = pressReleased;
+    uint32_t latchMs    = pressLatchMs;
+    uint32_t releaseMs  = pressReleaseMs;
+    pressLatched  = false;           // o polling viu a mudança; a trava da ISR não é mais necessária
+    pressReleased = false;
     if (btnStable == LOW) {          // apertou
-      btnPressedAtMs = now;
+      // Um toque completo ficou guardado na ISR antes deste aperto: trata ele primeiro.
+      if (hadLatch && hadRelease) handleRecoveredGesture(releaseMs - latchMs, now);
+      // Se o aperto começou com o loop parado, a ISR sabe a hora real.
+      // (Uma trava que já tem soltura é de um toque anterior: não serve como início deste aperto.)
+      btnPressedAtMs = (hadLatch && !hadRelease) ? latchMs : now;
       longPressFired = false;
-    } else if (!longPressFired) {    // soltou depois de um clique curto
-      if (now - lastClickMs > MULTI_CLICK_WINDOW_MS) clickCount = 0;
-      clickCount++;
-      lastClickMs = now;
-      if (clickCount >= CLICKS_TO_TRIGGER) { clickCount = 0; triggerAlert(); }
+      riseArmed      = true;
+    } else {                         // soltou
+      bool rose = !riseArmed;        // a ISR registrou a hora da soltura deste aperto
+      riseArmed = false;
+      if (longPressFired) {
+        // pressão longa já foi tratada enquanto segurava
+      } else if (rose && (int32_t)(lastRiseMs - btnPressedAtMs) >= (int32_t)LONG_PRESS_MS) {
+        // O loop travou com o botão seguro por 3 s: pela hora real da soltura, é pressão longa.
+        clickCount = 0;
+        if (alertActive()) cancelAlert(); else sendTest();
+      } else {
+        registerClick(now);          // soltou antes de 3 s: conta como clique
+      }
+      // Um toque inteiro guardado pela ISR depois desta soltura (loop parado): trata também.
+      if (hadLatch && hadRelease) handleRecoveredGesture(releaseMs - latchMs, now);
     }
   }
 
+  // Aperto e soltura inteiros aconteceram com o loop parado (ex.: conectando ao broker):
+  // o polling nunca viu o botão em LOW, mas a ISR guardou quando apertou e quando soltou.
+  // millis() novo e diferença com sinal: a ISR pode ter rodado depois de "now" ser lido.
+  if (pressLatched && pressReleased && btnStable == HIGH &&
+      (int32_t)(millis() - pressReleaseMs) >= (int32_t)DEBOUNCE_MS && digitalRead(PIN_BUTTON) == HIGH) {
+    uint32_t held = pressReleaseMs - pressLatchMs;
+    pressLatched  = false;
+    pressReleased = false;
+    handleRecoveredGesture(held, now);
+  }
+
   // Pressão longa dispara enquanto ainda está segurando, para o usuário sentir a resposta.
-  if (btnStable == LOW && !longPressFired && now - btnPressedAtMs >= LONG_PRESS_MS) {
+  // "reading == LOW" e "riseArmed": se o botão já foi solto (soltura ainda no debounce, ou durante
+  // um travamento do loop), quem decide é a soltura, medida pela hora real.
+  if (btnStable == LOW && reading == LOW && riseArmed && !longPressFired && now - btnPressedAtMs >= LONG_PRESS_MS) {
     longPressFired = true;
     clickCount = 0;
     if (alertActive()) cancelAlert(); else sendTest();
@@ -303,7 +450,7 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
         Serial.println("[ALERTA] App confirmou o recebimento.");
       } else if (strcmp(e.type, "test") == 0) {
         flash(GREEN, 1500, 150);
-        tone(PIN_BUZZER, 2000, 120);
+        if (!alertActive()) { beepActive = true; beepStartMs = millis(); }  // nunca faz som com alerta ativo
         Serial.println("[TESTE] Cadeia OK: o app respondeu.");
       } else if (strcmp(e.type, "cancel") == 0) {
         Serial.println("[ALERTA] App confirmou o cancelamento.");
@@ -316,13 +463,20 @@ void onMqttMessage(char *topic, byte *payload, unsigned int length) {
       dropOutboxForAlert(activeAlertId);
       activeAlertId[0] = '\0';
       activeAlertAcked = false;
+      activeAlertTs    = 0;
       persistAlert();
+      statusRequested = true;
       flash(GREEN, 1500, 150);
       Serial.println("[ALERTA] Encerrado pelo app.");
     }
   } else if (strcmp(cmd, "find") == 0) {
-    findUntilMs = millis() + FIND_DURATION_MS;
-    Serial.println("[ACHAR] Tocando para localizar o chaveiro.");
+    if (alertActive()) {
+      Serial.println("[ACHAR] Ignorado: com alerta ativo o chaveiro fica em silêncio.");
+    } else {
+      findActive  = true;
+      findStartMs = millis();
+      Serial.println("[ACHAR] Tocando para localizar o chaveiro.");
+    }
   } else if (strcmp(cmd, "ping") == 0) {
     statusRequested = true;  // responde com o status no próximo loop
   }
@@ -368,8 +522,9 @@ void ensureConnectivity() {
   if (now - lastMqttAttemptMs < mqttRetryMs) return;
   lastMqttAttemptMs = now;
 
-  char clientId[48];
-  snprintf(clientId, sizeof(clientId), "%s-%04lx", DEVICE_ID, (unsigned long)(esp_random() & 0xFFFF));
+  // clientId fixo: ao reconectar, o broker substitui a sessão antiga em vez de, minutos depois,
+  // publicar o "offline" dela por cima do status atual.
+  const char *clientId = DEVICE_ID;
   char will[96];
   snprintf(will, sizeof(will), "{\"deviceId\":\"%s\",\"online\":false}", DEVICE_ID);
   Serial.printf("[MQTT] Conectando em %s...\n", MQTT_HOST);
@@ -410,15 +565,18 @@ void serviceIndicators() {
   uint32_t now = millis();
   Color c = OFF;
   bool holding = btnStable == LOW && !longPressFired && now - btnPressedAtMs >= HOLD_HINT_MS;
+  if (flashActive && now - flashStartMs >= flashDurMs) flashActive = false;
+  if (findActive && now - findStartMs >= FIND_DURATION_MS) findActive = false;
+  if (beepActive && now - beepStartMs >= 120) beepActive = false;
 
-  if (now < flashUntilMs) {
+  if (flashActive) {
     c = (flashBlinkMs == 0 || blink(now, flashBlinkMs)) ? flashColor : OFF;
   } else if (holding) {
     c = AMBER;                                           // "continue segurando"
-  } else if (now < findUntilMs) {
+  } else if (findActive) {
     c = blink(now, 150) ? BLUE : WHITE;
   } else if (alertActive() && !activeAlertAcked) {
-    c = blink(now, 250) ? RED : OFF;                     // enviando / aguardando confirmação
+    c = pulse(now, 1000, 80) ? RED : OFF;                // enviando / aguardando confirmação (discreto)
   } else if (alertActive()) {
     c = pulse(now, 5000, 120) ? RED : OFF;               // alerta confirmado, ainda ativo
   } else if (!mqtt.connected()) {
@@ -431,8 +589,7 @@ void serviceIndicators() {
   setColor(c);
 
   // Buzzer só no "achar chaveiro". Alerta é sempre silencioso para não expor a vítima.
-  static bool buzzerOn = false;
-  bool wantBuzzer = now < findUntilMs && blink(now, 200);
+  bool wantBuzzer = !alertActive() && (beepActive || (findActive && blink(now, 200)));
   if (wantBuzzer != buzzerOn) {
     buzzerOn = wantBuzzer;
     if (buzzerOn) tone(PIN_BUZZER, 2700); else noTone(PIN_BUZZER);
@@ -443,6 +600,7 @@ void serviceIndicators() {
 void setup() {
   Serial.begin(115200);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), onButtonChange, CHANGE);
   pinMode(PIN_LED_R, OUTPUT);
   pinMode(PIN_LED_G, OUTPUT);
   pinMode(PIN_LED_B, OUTPUT);
@@ -462,10 +620,14 @@ void setup() {
   String savedAlert = prefs.getString("alertId", "");
   strlcpy(activeAlertId, savedAlert.c_str(), sizeof(activeAlertId));
   activeAlertAcked = prefs.getBool("alertAcked", false);
+  activeAlertTs    = (time_t)prefs.getLong64("alertTs", 0);
   if (alertActive()) {
     Serial.printf("[ALERTA] Alerta %s recuperado da memória (%s).\n", activeAlertId,
                   activeAlertAcked ? "já confirmado" : "reenviando");
-    if (!activeAlertAcked) enqueue("alert", true, activeAlertId, activeAlertId);
+    if (!activeAlertAcked) {
+      OutEvent *e = enqueue("alert", true, activeAlertId, activeAlertId);
+      e->createdTs = activeAlertTs;  // mantém a hora original do clique (ageMs passa a contar do reinício)
+    }
   }
 
   batteryPct = readBatteryPct();
@@ -478,6 +640,7 @@ void setup() {
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(onMqttMessage);
   mqtt.setBufferSize(512);
+  mqtt.setSocketTimeout(5);  // espera no máximo 5 s pelo CONNACK (padrão 15 s)
   mqtt.setKeepAlive(60);  // folga para o simulador, que às vezes roda abaixo de 100%
 }
 

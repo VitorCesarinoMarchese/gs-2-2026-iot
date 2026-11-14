@@ -61,10 +61,10 @@ Reconecte automaticamente e reassine os tópicos depois de reconectar. O broker 
 
 ```json
 {
-  "eventId": "chaveiro-0001-17",
+  "eventId": "chaveiro-0001-6737a1f0-17",
   "type": "alert",
   "deviceId": "chaveiro-0001",
-  "alertId": "chaveiro-0001-17",
+  "alertId": "chaveiro-0001-6737a1f0-17",
   "ts": 1763089200,
   "ageMs": 140,
   "attempt": 1,
@@ -75,10 +75,10 @@ Reconecte automaticamente e reassine os tópicos depois de reconectar. O broker 
 
 | Campo | Uso no app |
 |---|---|
-| `eventId` | chave para descartar repetidos |
+| `eventId` | chave para descartar repetidos. Texto opaco: não tente interpretar o formato. |
 | `type` | `alert`, `cancel`, `test` ou `low_battery` |
-| `alertId` | em `alert`, igual ao `eventId`. Em `cancel`, o alerta que foi cancelado. |
-| `ts` | hora do clique (segundos Unix, UTC). Pode vir `null`: nesse caso use `agora - ageMs`. |
+| `alertId` | em `alert`, igual ao `eventId`. Em `cancel`, o alerta que foi cancelado: procure o alerta por esse campo. |
+| `ts` | hora do clique (segundos Unix, UTC). Pode vir `null`: nesse caso use `agora - ageMs` (aproximado se o chaveiro reiniciou no meio). |
 | `battery` | % de bateria do chaveiro |
 
 ### Status que chega em `.../status` (mensagem retida)
@@ -88,7 +88,7 @@ Reconecte automaticamente e reassine os tópicos depois de reconectar. O broker 
   "rssi": -61, "alertActive": false, "alertId": null, "uptimeS": 3600, "fw": "1.0.0" }
 ```
 
-Chega ao assinar (é retida), a cada 30 s e depois de um `ping`. Se o chaveiro cair, chega `{"deviceId":"chaveiro-0001","online":false}`, sem os outros campos.
+Chega ao assinar (é retida), a cada 30 s, logo depois de um alerta abrir ou fechar, e depois de um `ping`. Se o chaveiro cair, chega `{"deviceId":"chaveiro-0001","online":false}`, sem os outros campos.
 
 ### Comandos que o app publica em `.../cmd`
 
@@ -96,7 +96,7 @@ Chega ao assinar (é retida), a cada 30 s e depois de um `ping`. Se o chaveiro c
 |---|---|
 | `{"cmd":"ack","eventId":"..."}` | ao receber `alert`, `cancel` ou `test`. **Toda vez que o evento chegar**, inclusive repetido. |
 | `{"cmd":"resolve","alertId":"..."}` | quando o usuário encerra o alerta pelo app |
-| `{"cmd":"find"}` | botão "Achar meu chaveiro" (o chaveiro pisca e toca por 6 s) |
+| `{"cmd":"find"}` | botão "Achar meu chaveiro" (o chaveiro pisca e toca por 6 s). Desabilite o botão durante um alerta: o chaveiro ignora o comando para não fazer barulho. |
 | `{"cmd":"ping"}` | ao abrir a tela inicial ou puxar para atualizar |
 
 ### Regra de ouro: idempotência
@@ -108,11 +108,15 @@ O chaveiro reenvia `alert`, `cancel` e `test` a cada 5 s até receber `ack`. O a
 
 Guarde os `eventId` no SQLite, não só em memória, para a regra valer depois de fechar o app.
 
+Processe os eventos **na ordem de chegada**. O chaveiro garante que um `cancel` antigo chega antes de um `alert` mais novo, então "fechar todos os alertas ativos" num `cancel` nunca fecha uma emergência que ainda não chegou.
+
+Um novo `alert` com `alertId` diferente enquanto outro alerta está aberto é uma **nova emergência** (o usuário clicou de novo depois do primeiro ser confirmado). Trate como um alerta novo.
+
 ## 6. O que fazer com cada evento
 
 ### `alert`: o fluxo principal
 
-1. Gravar o alerta (status `ativo`) e responder `ack`. O LED do chaveiro fica vermelho fixo: o usuário sabe que o app recebeu.
+1. Gravar o alerta (status `ativo`) e responder `ack`. O LED do chaveiro fica vermelho fixo por 3 s: o usuário sabe que o app recebeu.
 2. Abrir a tela **Alerta ativo** por cima de qualquer tela, com vibração (`expo-haptics`) e notificação local de alta prioridade (`expo-notifications`) se o app estiver em segundo plano.
 3. **Bloquear o celular** (ver seção 7) e registrar o passo.
 4. **Acionar a polícia**: `POST` na API mock de ocorrências (seção 8) e registrar o passo com o protocolo devolvido.
@@ -124,9 +128,10 @@ O alerta deve ser silencioso no celular também: vibração sim, som alto não. 
 ### `cancel`: o usuário segurou o botão 3 s ("estou bem")
 
 1. Responder `ack`.
-2. Mudar o alerta para `cancelado`, registrar a hora.
-3. Avisar polícia e contatos do cancelamento (mesmo mecanismo simulado).
-4. Fechar a tela de alerta e mostrar "Alerta cancelado pelo chaveiro".
+2. "Estou bem" vale para o usuário, não só para um alerta: feche **todos** os alertas ainda ativos desse `deviceId`, mesmo que o `alertId` do evento seja desconhecido (o alerta pode nem ter chegado). Se não houver nenhum alerta ativo, pare aqui.
+3. Mudar esses alertas para `cancelado`, registrar a hora.
+4. Avisar polícia e contatos do cancelamento (mesmo mecanismo simulado).
+5. Fechar a tela de alerta e mostrar "Alerta cancelado pelo chaveiro".
 
 ### `test`: o usuário segurou o botão 3 s sem alerta ativo
 
@@ -161,7 +166,7 @@ Não há API pública para acionar o 190 automaticamente, e enviar SMS sem o usu
 
   ```
   POST /ocorrencias
-  { "alertId": "chaveiro-0001-17", "deviceId": "chaveiro-0001", "ts": 1763089200,
+  { "alertId": "chaveiro-0001-6737a1f0-17", "deviceId": "chaveiro-0001", "ts": 1763089200,
     "localizacao": { "lat": -23.5641, "lng": -46.6527 } }
 
   201 { "protocolo": "SP-2026-000123", "status": "recebida" }
@@ -278,7 +283,7 @@ O broker é público. Para não receber eventos de outras equipes, use sempre o 
 
 - [ ] Parear com `chaveiro-0001` e ver online/offline e bateria atualizando sozinhos.
 - [ ] Cadastrar, editar e excluir contatos. Os dados continuam lá depois de fechar o app.
-- [ ] Clique no chaveiro (Wokwi) → em até 3 s o app abre a tela de alerta, mostra os passos e o LED do chaveiro fica vermelho fixo (recebeu o `ack`).
+- [ ] Clique no chaveiro (Wokwi) → em até 3 s o app abre a tela de alerta, mostra os passos e o LED do chaveiro fica vermelho fixo por 3 s (recebeu o `ack`).
 - [ ] O mesmo `eventId` recebido 5 vezes gera 1 alerta no histórico e 5 `ack`.
 - [ ] Segurar 3 s no chaveiro durante o alerta → app mostra "cancelado" e fecha a tela de alerta.
 - [ ] Segurar 3 s sem alerta → app mostra "Chaveiro funcionando" e não aciona ninguém.

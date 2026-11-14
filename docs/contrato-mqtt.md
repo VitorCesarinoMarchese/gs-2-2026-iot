@@ -27,10 +27,10 @@ Todos têm o mesmo formato:
 
 ```json
 {
-  "eventId": "chaveiro-0001-17",
+  "eventId": "chaveiro-0001-6737a1f0-17",
   "type": "alert",
   "deviceId": "chaveiro-0001",
-  "alertId": "chaveiro-0001-17",
+  "alertId": "chaveiro-0001-6737a1f0-17",
   "ts": 1763089200,
   "ageMs": 140,
   "attempt": 1,
@@ -41,11 +41,11 @@ Todos têm o mesmo formato:
 
 | Campo | Significado |
 |---|---|
-| `eventId` | único por evento, também entre reinícios do chaveiro. Use para descartar repetidos. |
+| `eventId` | único por evento, também entre reinícios e entre execuções do simulador (o meio do id muda a cada boot). Trate como texto opaco e use para descartar repetidos. |
 | `type` | `alert`, `cancel`, `test` ou `low_battery` |
-| `alertId` | em `alert` é igual ao `eventId`; em `cancel` diz qual alerta foi cancelado |
+| `alertId` | em `alert` é igual ao `eventId`; em `cancel` diz qual alerta foi cancelado (pode ser um que nunca chegou ao app; mesmo assim, o cancelamento fecha todos os alertas ativos do chaveiro). |
 | `ts` | hora do clique em segundos Unix (UTC). Vem `null` se o chaveiro ainda não sincronizou o relógio. |
-| `ageMs` | há quantos milissegundos o botão foi apertado. Com `ts: null`, a hora do clique é `hora de chegada - ageMs`. |
+| `ageMs` | há quantos milissegundos o botão foi apertado. Com `ts: null`, a hora do clique é `hora de chegada - ageMs`. Exceção: num alerta reenviado depois de um reinício, `ageMs` conta a partir do reinício; prefira `ts` quando vier preenchido. |
 | `attempt` | número da tentativa de envio (1, 2, 3...) |
 | `battery` | bateria em % |
 
@@ -53,8 +53,8 @@ Todos têm o mesmo formato:
 
 | `type` | Gesto | Precisa de `ack`? | O que o app/backend faz |
 |---|---|---|---|
-| `alert` | 1 clique | sim | bloqueia o celular, anexa a última localização do celular, aciona a polícia e os contatos |
-| `cancel` | segurar 3 s com alerta ativo | sim | avisa a polícia e os contatos que o usuário está bem |
+| `alert` | 1 clique (soltar antes de 3 s também conta como clique) | sim | bloqueia o celular, anexa a última localização do celular, aciona a polícia e os contatos |
+| `cancel` | segurar 3 s com alerta ativo | sim | avisa a polícia e os contatos que o usuário está bem. Fecha todos os alertas ativos do chaveiro, não só o `alertId` indicado. |
 | `test` | segurar 3 s sem alerta | sim | só mostra "chaveiro funcionando" no app. Ninguém é acionado. |
 | `low_battery` | bateria ≤ 15% | não | notificação "carregue seu chaveiro" |
 
@@ -62,7 +62,11 @@ Todos têm o mesmo formato:
 
 Eventos que precisam de `ack` são reenviados a cada 5 s até o app responder. Se o chaveiro está sem rede, o evento espera e sai quando a conexão voltar. Um alerta sem confirmação também sobrevive a um reinício do chaveiro.
 
+O chaveiro sempre envia os eventos pendentes na ordem em que aconteceram, e um alerta novo só sai depois dos eventos antigos ainda sem confirmação. Processe os eventos na ordem de chegada.
+
 Por isso o app **vai receber o mesmo `eventId` mais de uma vez**. A regra é: executar a ação só na primeira vez e mandar `ack` todas as vezes.
+
+Se um alerta já confirmado continua aberto (ninguém mandou `resolve`) e o usuário clica de novo, o chaveiro abre **outro** alerta, com `alertId` novo. É uma nova emergência.
 
 ## Status (`.../status`, retido)
 
@@ -80,15 +84,15 @@ Por isso o app **vai receber o mesmo `eventId` mais de uma vez**. A regra é: ex
 }
 ```
 
-Sai ao conectar, a cada 30 s e quando o app manda `ping`. Se o chaveiro cair, o broker publica a "última vontade" `{"deviceId": "chaveiro-0001", "online": false}` no mesmo tópico. Como a mensagem é retida, o app recebe o último estado assim que se inscreve.
+Sai ao conectar, a cada 30 s, logo depois de um alerta abrir ou fechar, e quando o app manda `ping`. Se o chaveiro cair, o broker publica a "última vontade" `{"deviceId": "chaveiro-0001", "online": false}` no mesmo tópico. Como a mensagem é retida, o app recebe o último estado assim que se inscreve.
 
 ## Comandos (`.../cmd`)
 
 | Comando | Exemplo | Efeito no chaveiro |
 |---|---|---|
-| `ack` | `{"cmd":"ack","eventId":"chaveiro-0001-17"}` | para o reenvio. Em alerta: LED vermelho fixo por 3 s ("ajuda a caminho"). Em teste: LED verde e um bipe. |
-| `resolve` | `{"cmd":"resolve","alertId":"chaveiro-0001-17"}` | encerra o alerta (o usuário cancelou pelo app ou a ocorrência foi fechada) |
-| `find` | `{"cmd":"find"}` | pisca e toca por 6 s para achar as chaves |
+| `ack` | `{"cmd":"ack","eventId":"chaveiro-0001-6737a1f0-17"}` | para o reenvio. Em alerta: LED vermelho fixo por 3 s ("ajuda a caminho"). Em teste: LED verde e um bipe (sem bipe se houver alerta ativo). |
+| `resolve` | `{"cmd":"resolve","alertId":"chaveiro-0001-6737a1f0-17"}` | encerra o alerta (o usuário cancelou pelo app ou a ocorrência foi fechada) |
+| `find` | `{"cmd":"find"}` | pisca e toca por 6 s para achar as chaves. Ignorado com alerta ativo: o chaveiro nunca faz som durante um alerta. |
 | `ping` | `{"cmd":"ping"}` | publica o status na hora |
 
 ## Testar sem o app

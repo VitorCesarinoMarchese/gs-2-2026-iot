@@ -46,11 +46,11 @@ flowchart LR
 
 | Gesto | O que acontece |
 |---|---|
-| **1 clique** | dispara o alerta. Sai na hora e é reenviado a cada 5 s até o app confirmar. |
+| **1 clique** | dispara o alerta. Sai na hora e é reenviado a cada 5 s até o app confirmar. Soltar o botão antes de 3 s também conta como clique: na dúvida, o chaveiro pede ajuda. |
 | **Segurar 3 s** com alerta ativo | cancela ("estou bem") |
 | **Segurar 3 s** sem alerta | teste: confere se a cadeia chaveiro → app funciona, sem acionar ninguém |
 
-O chaveiro não perde alerta. Se não houver rede, o evento espera e sai quando a conexão voltar. Se a bateria acabar ou o chaveiro reiniciar no meio do alerta, ele lembra (fica salvo na flash) e continua tentando.
+O chaveiro não perde alerta. Se não houver rede, o evento espera e sai quando a conexão voltar. Se a bateria acabar ou o chaveiro reiniciar no meio do alerta, ele lembra (fica salvo na flash) e continua tentando. No Wokwi, cada vez que a simulação recomeça a flash começa vazia, então essa parte só aparece no hardware real.
 
 O app pode mandar comandos de volta: confirmar o recebimento, encerrar o alerta e "achar meu chaveiro" (pisca e toca).
 
@@ -73,11 +73,11 @@ O que o app precisa fazer (telas, fluxo do alerta, banco, critérios de aceite) 
 |---|---|
 | piscada verde curta a cada 4 s | conectado, tudo certo |
 | piscada azul a cada 1 s | procurando rede |
-| vermelho piscando rápido | alerta enviado, esperando o app confirmar |
+| piscada vermelha curta a cada 1 s | alerta enviado, esperando o app confirmar |
 | vermelho fixo por 3 s | app confirmou: ajuda a caminho |
 | piscada vermelha a cada 5 s | alerta continua ativo |
 | âmbar fixo | você está segurando o botão: continue até 3 s |
-| verde piscando | cancelamento ou teste confirmado |
+| verde piscando | alerta cancelado (na hora, no chaveiro) ou teste confirmado pelo app |
 | piscada âmbar a cada 4 s | bateria baixa (≤ 15%) |
 | azul e branco + bipes | "achar chaveiro" |
 
@@ -91,6 +91,8 @@ O que o app precisa fazer (telas, fluxo do alerta, banco, critérios de aceite) 
 4. Clique em ▶. O monitor serial mostra a conexão e cada evento.
 
 O Wokwi conecta na rede `Wokwi-GUEST` sozinho, sem configurar nada.
+
+Não rode duas simulações com o mesmo `DEVICE_ID` ao mesmo tempo (por exemplo, você e um colega): as duas usam o mesmo cliente no broker e ficam derrubando uma à outra. Se mais alguém for testar junto, troque o `DEVICE_ID` em `sketch.ino` na cópia dele.
 
 ### No VS Code (extensão Wokwi) ou terminal
 
